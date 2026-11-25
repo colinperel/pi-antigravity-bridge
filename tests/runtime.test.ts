@@ -355,3 +355,80 @@ test("bridgeRealm survives module reload with live member, prefers newest duplic
 	await sOther.leave();
 	await sNew.leave();
 });
+
+test("bridgeRealm fails closed requiring restart when an incompatible pre-upgrade writer is resident", async () => {
+	const dir = withTmpAgentDir();
+	const sessionsPath = path.join(dir, "antigravity-bridge", "sessions.json");
+	fs.mkdirSync(path.dirname(sessionsPath), { recursive: true });
+	const realmKey = Symbol.for("pi-antigravity-bridge.runtime");
+	const realmBrand = Symbol.for("pi-antigravity-bridge.realm.brand");
+
+	// Simulate an active pre-upgrade SessionStore mid-write (unlocked, no clearNow).
+	let releaseLegacyWrite!: () => void;
+	const legacyWriteGate = new Promise<void>((resolve) => {
+		releaseLegacyWrite = resolve;
+	});
+	const legacyData: Record<string, { conversationId: string; lastStepIdx: number }> = {};
+	let legacyChain = Promise.resolve();
+	const legacyStore = {
+		get: (k: string) => legacyData[k] ?? null,
+		set: (k: string, v: { conversationId: string; lastStepIdx: number }) => {
+			legacyData[k] = v;
+			legacyChain = legacyChain.then(async () => {
+				const tmp = `${sessionsPath}.legacy.tmp`;
+				await fs.promises.writeFile(tmp, JSON.stringify(legacyData, null, 2) + "\n", { mode: 0o600 });
+				await legacyWriteGate;
+				await fs.promises.rename(tmp, sessionsPath);
+			});
+		},
+		delete: () => {},
+		clear: () => {},
+		flush: async () => {
+			await legacyChain;
+		},
+		get size() {
+			return Object.keys(legacyData).length;
+		},
+	};
+	const legacyRealm = {
+		[realmBrand]: true,
+		store: legacyStore,
+		streamSimple: makeStream("from-legacy"),
+		join: () => ({
+			attachBridge: async () => ({ ok: false, first: false }),
+			leave: async () => {},
+		}),
+		dispose: async () => {},
+	};
+	Reflect.set(globalThis, realmKey, legacyRealm);
+
+	// Legacy member starts an in-flight unlocked write before /reload runs.
+	legacyStore.set("sid:parent", { conversationId: "conv-parent", lastStepIdx: 1 });
+
+	// Upgraded runtime must fail closed rather than spawning a competing locked writer.
+	assert.throws(() => bridgeRealm(), /restart Pi/i);
+	assert.equal(Reflect.get(globalThis, realmKey), legacyRealm);
+
+	// Extension factory must also fail closed before registering commands or touching the realm.
+	const registeredCommands: string[] = [];
+	const pi: any = new Proxy(
+		{
+			registerCommand: (name: string) => registeredCommands.push(name),
+		},
+		{
+			get(target, prop) {
+				return prop in target ? (target as any)[prop] : () => {};
+			},
+		},
+	);
+	const { default: register } = await import("../extensions/index.js");
+	await assert.rejects(() => register(pi), /restart Pi/i);
+	assert.deepEqual(registeredCommands, []);
+	assert.equal(Reflect.get(globalThis, realmKey), legacyRealm);
+
+	// Resident legacy member finishes its write cleanly with no competing writer.
+	releaseLegacyWrite();
+	await legacyStore.flush();
+	const disk = JSON.parse(fs.readFileSync(sessionsPath, "utf8")) as Record<string, { conversationId: string }>;
+	assert.equal(disk["sid:parent"]?.conversationId, "conv-parent");
+});

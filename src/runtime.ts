@@ -34,6 +34,9 @@ import { SessionStore } from "./sessions.js";
 const REALM_KEY = Symbol.for("pi-antigravity-bridge.runtime");
 const REALM_BRAND = Symbol.for("pi-antigravity-bridge.realm.brand");
 
+export const REALM_UPGRADE_RESTART_MESSAGE =
+	"Antigravity bridge was upgraded in place while an older runtime is still loaded; restart Pi to use the upgraded session store.";
+
 /** The approval hook script of this realm (one per process, realmToken embedded). */
 export function approvalHookScriptPath(): string {
 	return path.join(logsDir(), `approval-hook-${process.pid}.js`);
@@ -293,10 +296,20 @@ function isRealm(value: unknown): value is Realm {
 	return typeof value === "object" && value !== null && Reflect.get(value, REALM_BRAND) === true;
 }
 
-/** This realm's bridge runtime, created on first use. */
+function hasLockedStore(realm: BridgeRealm): boolean {
+	return typeof (realm.store as Partial<SessionStore> | undefined)?.clearNow === "function";
+}
+
+/** This realm's bridge runtime, created on first use. Fails closed if an
+ *  incompatible pre-upgrade realm is still resident on globalThis (from an
+ *  in-place /reload) so two incompatible SessionStore implementations can
+ *  never write sessions.json concurrently or split live realm members. */
 export function bridgeRealm(): BridgeRealm {
 	const existing: unknown = Reflect.get(globalThis, REALM_KEY);
-	if (isRealm(existing)) return existing;
+	if (isRealm(existing)) {
+		if (hasLockedStore(existing)) return existing;
+		throw new Error(REALM_UPGRADE_RESTART_MESSAGE);
+	}
 	const realm = new Realm();
 	Reflect.set(globalThis, REALM_KEY, realm);
 	return realm;

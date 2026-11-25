@@ -7,6 +7,7 @@ import {
 	formatBridgeToolInfo,
 	parseBridgeCallRequest,
 	partitionBridgeTools,
+	proxiedBridgeTools,
 	serializeToolSchema,
 } from "../src/bridge-catalog.js";
 
@@ -161,6 +162,26 @@ describe("hybrid partition and proxy helpers", () => {
 		expect(direct.map((t) => t.name)).toEqual(["read"]);
 		expect(proxied.map((t) => t.name)).toEqual(["git_commit"]);
 	});
+
+	it("exposes pi-suba child lifecycle tools directly while keeping parent suba tools proxied", () => {
+		const catalog = [
+			{ name: "suba_ask", sourceInfo: { source: "extension" } },
+			{ name: "suba_done", sourceInfo: { source: "extension" } },
+			{ name: "suba_notify", sourceInfo: { source: "extension" } },
+			{ name: "suba", sourceInfo: { source: "extension" } },
+			{ name: "suba_send", sourceInfo: { source: "extension" } },
+			{ name: "process", sourceInfo: { source: "extension" } },
+		];
+		const authorized = bridgedPiTools(
+			catalog,
+			catalog.map((t) => t.name),
+			"all",
+			new Set(),
+		);
+		const { direct, proxied } = partitionBridgeTools(authorized);
+		expect(direct.map((t) => t.name)).toEqual(["suba_ask", "suba_done", "suba_notify"]);
+		expect(proxied.map((t) => t.name)).toEqual(["suba", "suba_send", "process"]);
+	});
 });
 
 describe("codemode catalog mode", () => {
@@ -205,5 +226,26 @@ describe("codemodeCatalog projection", () => {
 		const { direct, proxied } = codemodeCatalog(authorized);
 		expect(direct).toEqual([]);
 		expect(proxied.map((t) => t.name)).toEqual(["subagent"]);
+	});
+
+	it("proxiedBridgeTools keeps bridge_tool_info aligned with tools/list in codemode and all modes", () => {
+		const authorized = [
+			{ name: "codemode", description: "Run scripts.", parameters: { type: "object" } },
+			{ name: "suba_done", description: "Finish child.", parameters: { type: "object", properties: { summary: { type: "string" } } } },
+			{ name: "suba_ask", description: "Ask parent.", parameters: { type: "object" } },
+			{ name: "read", description: "Extension read.", parameters: { type: "object" } },
+			{ name: "process", description: "Manage processes.", parameters: { type: "object" } },
+		];
+		const codemodeProxied = proxiedBridgeTools(authorized, "codemode");
+		expect(codemodeProxied.map((t) => t.name)).toEqual(["suba_done", "suba_ask", "read", "process"]);
+		const lookup = formatBridgeToolInfo(codemodeProxied, ["suba_done", "read"]);
+		expect(lookup.isError).toBe(false);
+		expect(lookup.content[0]?.text).toContain("suba_done");
+		expect(lookup.content[0]?.text).toContain("read");
+		const listAll = formatBridgeToolInfo(codemodeProxied, ["*"]);
+		expect(listAll.content[0]?.text).toContain("suba_done");
+
+		const allProxied = proxiedBridgeTools(authorized, "all");
+		expect(allProxied.map((t) => t.name)).toEqual(["codemode", "process"]);
 	});
 });

@@ -131,7 +131,7 @@ Boolean keys (`readOnly`, `skipPermissions`, `askTool`, `webTools`, `digest`, `s
 
 Env overrides: `AGY_BRIDGE_TOOLS`, `AGY_ASK_TOOL`, `AGY_WEB_TOOLS`, `AGY_DIGEST`, `AGY_SYSTEM_PROMPT`, `AGY_TURN_TIMEOUT_MIN`, `AGY_INACTIVITY_TIMEOUT_MIN`, `AGY_ACP_SESSION_TIMEOUT_MS`, `AGY_ACP_SESSION_RETRY`. Env wins over the file, so while `AGY_DIGEST` or `AGY_SYSTEM_PROMPT` is set, the matching `/agy digest` or `/agy system-prompt` toggle persists a value that never takes effect.
 
-The `activate_skill` catalog mirrors pi's directory-based skill discovery: the two global dirs plus project dirs, the latter only when pi has trusted the project (same gate pi itself applies). Pi's other skill sources - the `skills` settings array, `package.json` entries, and `--skill` CLI paths - are not mirrored and won't appear in the catalog.
+The `activate_skill` catalog mirrors pi's loaded model-invocable skills via `pi.getCommands()` (honoring `--no-skills`, `--skill` CLI paths, settings filters, package skills, `disable-model-invocation: true`, and project trust).
 
 ### The /agy command
 

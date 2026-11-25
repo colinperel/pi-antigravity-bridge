@@ -104,8 +104,8 @@ import {
 	activateSkillSchema,
 	catalogSummary,
 	findSkillByName,
-	readSkillBody,
-	scanSkills,
+	readModelInvocableSkill,
+	skillsFromCommands,
 	type SkillLite,
 } from "../src/skills.js";
 import { mapAgyToolToNative } from "../src/native-tools.js";
@@ -118,6 +118,7 @@ import {
 	formatBridgeToolInfo,
 	parseBridgeCallRequest,
 	partitionBridgeTools,
+	proxiedBridgeTools,
 	codemodeCatalog,
 	serializeToolSchema,
 } from "../src/bridge-catalog.js";
@@ -130,6 +131,11 @@ function resolveAgyBinary(): string {
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
+	// Acquire (or validate) the process realm before any side effects so an
+	// in-place /reload over an incompatible pre-upgrade runtime fails closed
+	// with a restart-required error instead of spawning a second store writer.
+	const realm = bridgeRealm();
+	const store = realm.store;
 	// Per-factory UI reference so child session_shutdown never clears the
 	// parent's UI context.
 	let activeUi: ExtensionUIContext | null = null;
@@ -205,6 +211,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			text = "Antigravity process exited unexpectedly";
 		} else if (event === "turn-error") {
 			text = `Antigravity turn issue: ${String(d.reason ?? "unknown")}`;
+		} else if (event === "session-store-flush-error") {
+			text = `Failed to persist Antigravity session bindings: ${String(d.error ?? "unknown")}`;
 		} else {
 			text = `Antigravity warning: ${event}`;
 		}
@@ -217,8 +225,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		"info",
 	);
 
-	const realm = bridgeRealm();
-	const store = realm.store;
 	// MCP bridge handle, declared early: the ACP engine reads the bridge port
 	// at session/new / session/load time.
 	let mcpHandle: BridgeEndpoint | null = null;
@@ -627,16 +633,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	// Bindings must reach disk before the host exits (headless/print modes
 	// exit right after session_shutdown).
-	pi.on("session_shutdown", () => store.flush());
+	pi.on("session_shutdown", (_event, ctx) =>
+		store.flush().catch((err) => {
+			if (!ctx.hasUI) activeUi = null;
+			fileLog.log("session-store-flush-error", { error: err instanceof Error ? err.message : String(err) }, "warn");
+		}),
+	);
 	// Session keys whose bound agy conversation was rotated on session_compact
 	// so the next turn starts a fresh backend conversation and ships the
 	// compaction summary once (even when config.digest is disabled).
 	const pendingCompactionHandoff = new Set<string>();
+	const handoffGeneration = new Map<string, number>();
+	let handoffSeq = 0;
 	pi.on("session_shutdown", () => {
 		backgroundWatchDisposed = true;
 		for (const handle of backgroundWatchers.values()) handle.stop();
 		backgroundWatchers.clear();
 		pendingCompactionHandoff.clear();
+		handoffGeneration.clear();
 	});
 	pi.on("session_compact", (_event, ctx) => {
 		try {
@@ -647,6 +661,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const key = sessionKey(sid ? { sessionId: sid } : undefined, ctx.cwd, engine);
 			const rotated = rotateSessionOnCompaction(store, key, pendingCompactionHandoff);
 			if (rotated) {
+				handoffGeneration.set(key, ++handoffSeq);
 				fileLog.log("session-compact-rotate", { key, previousConversation: rotated }, "info");
 			}
 		} catch (err) {
@@ -743,6 +758,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		fileLog,
 		roster,
 		pendingCompactionHandoff,
+		clearHandoffsThrough: (snapshot, cutoff) => {
+			for (const key of snapshot) {
+				if ((handoffGeneration.get(key) ?? 0) <= cutoff) {
+					pendingCompactionHandoff.delete(key);
+					handoffGeneration.delete(key);
+				}
+			}
+		},
+		currentHandoffSeq: () => handoffSeq,
 		checkAgySetup,
 		setActiveUi: (ui) => {
 			activeUi = ui;
@@ -999,16 +1023,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (mcpHandle) return; // already running (reload re-fires session_start)
 		gateUnavailable = gateWanted ? "approval gate not staged yet" : undefined;
 		if (bridgeMode === "none" && !gateWanted) return; // user opted out
-		// pi loads project skill locations only after the project is trusted;
-		// mirror that gate. Global skill dirs are always scanned.
-		const skills: SkillLite[] = scanSkills(ctx.isProjectTrusted() ? { projectDir: process.cwd() } : {});
+		// Mirror Pi's loaded model-invocable skill set via pi.getCommands()
+		// (honoring --no-skills, --skill, settings filters, package skills,
+		// disable-model-invocation, and project trust).
+		const getSkills = (): SkillLite[] => {
+			const commands = typeof pi.getCommands === "function" ? pi.getCommands() : undefined;
+			return Array.isArray(commands) ? skillsFromCommands(commands) : [];
+		};
 		const listTools = () => {
 			// /mcp and pi.setActiveTools() update the same live catalog. ACP gets
 			// this endpoint through session/new or session/load; no global config write.
 			const mode = loadConfig().bridgeTools;
 			const authorized = getBridgeTools();
 			const codemode = mode === "codemode" ? codemodeCatalog(authorized) : null;
-			const { direct, proxied } = partitionBridgeTools(authorized);
+			const { direct } = partitionBridgeTools(authorized);
 			const directDefs = codemode
 				? codemode.direct
 				: direct.map((t) => ({
@@ -1017,10 +1045,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 						inputSchema: serializeToolSchema(t.parameters),
 					}));
 			const tools = directDefs;
-			const proxiedForInfo = codemode ? codemode.proxied : proxied;
+			const proxiedForInfo = proxiedBridgeTools(authorized, mode);
 			if (mode !== "none" && proxiedForInfo.length > 0) {
 				tools.push(bridgeToolInfoDef(proxiedForInfo), bridgeCallToolDef());
 			}
+			const skills = mode !== "none" ? getSkills() : [];
 			if (skills.length > 0 && mode !== "none") {
 				tools.push({
 					name: ACTIVATE_SKILL_TOOL_NAME,
@@ -1067,7 +1096,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				return Promise.resolve(formatPollAnswer(wanted, view));
 			}
 			if (name === TOOL_INFO_TOOL_NAME) {
-				const { proxied } = partitionBridgeTools(getBridgeTools());
+				const proxied = proxiedBridgeTools(getBridgeTools(), loadConfig().bridgeTools);
 				return Promise.resolve(formatBridgeToolInfo(proxied, args.names));
 			}
 			const dispatchPiTool = (targetName: string, targetArgs: Record<string, unknown>) =>
@@ -1094,16 +1123,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				return dispatchPiTool(name, args);
 			}
 			const wanted = typeof args.name === "string" ? args.name : "";
-			const skill = loadConfig().bridgeTools !== "none" ? findSkillByName(skills, wanted) : undefined;
-			const body = skill ? readSkillBody(skill) : `unknown skill: ${wanted || "(none given)"}`;
+			const skill = loadConfig().bridgeTools !== "none" ? findSkillByName(getSkills(), wanted) : undefined;
+			if (!skill) {
+				return Promise.resolve({
+					content: [{ type: "text", text: `Error: unknown skill: ${wanted || "(none given)"}` }],
+					isError: true,
+				});
+			}
+			const read = readModelInvocableSkill(skill.filePath);
 			return Promise.resolve({
 				content: [
 					{
 						type: "text",
-						text: skill ? `${body}\n\n[skill resources dir: ${skill.dir}]` : `Error: ${body}`,
+						text: read.ok ? `${read.body}\n\n[skill resources dir: ${skill.dir}]` : `Error: ${read.error}`,
 					},
 				],
-				isError: !skill,
+				isError: !read.ok,
 			});
 		};
 		const r = await realmSession.attachBridge(
@@ -1324,6 +1359,8 @@ interface AgyCommandCtx {
 	/** Live subagent roster (folded in the provider); /agy subagents. */
 	roster: SubagentRoster;
 	pendingCompactionHandoff: Set<string>;
+	clearHandoffsThrough: (snapshot: ReadonlySet<string>, cutoff: number) => void;
+	currentHandoffSeq: () => number;
 	checkAgySetup: (ctx: { ui: ExtensionUIContext; mode: string }, engine: Engine, explicit?: boolean) => Promise<void>;
 	setActiveUi: (ui: ExtensionUIContext) => void;
 }
@@ -1392,7 +1429,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 			"Antigravity provider: doctor (health + settings), settings picker, clear sessions. Usage: /agy [doctor|auth|auth-manual|engine stream-json|acp|mode plan|accept-edits|readonly on|off|permissions on|off|ask on|off|model <alias>|thinking low|medium|high|xhigh|agent <name|off>|subagents|quota|artifacts [open <n|name>]|tasks [tail <id>]|bridge all|mcp|codemode|none|tools [hide|show <name>|reset]|web on|off|digest on|off|system-prompt on|off|timeout <1-1440|off>|patch-cleanup|clear]",
 		handler: async (args, cmdCtx: ExtensionCommandContext) => {
 			const ui = cmdCtx.ui;
-			if (ui) ctx.setActiveUi(ui);
+			if (cmdCtx.hasUI && ui) ctx.setActiveUi(ui);
 			const mode = cmdCtx.mode;
 			const sub = (args ?? "").trim().split(/\s+/)[0]?.toLowerCase();
 			const val = (args ?? "").trim().split(/\s+/)[1]?.toLowerCase();
@@ -1400,9 +1437,18 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 
 			// Direct subcommands work everywhere (headless + TUI).
 			if (sub === "clear") {
-				ctx.store.clear();
-				ctx.pendingCompactionHandoff.clear();
-				ui?.notify("Cleared all antigravity session bindings.", "info");
+				const handoffSnapshot = new Set(ctx.pendingCompactionHandoff);
+				const handoffCutoff = ctx.currentHandoffSeq();
+				try {
+					await ctx.store.clearNow();
+					ctx.clearHandoffsThrough(handoffSnapshot, handoffCutoff);
+					if (cmdCtx.hasUI && ui) ui.notify("Cleared all antigravity session bindings.", "info");
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const text = `Failed to clear antigravity session bindings: ${message}`;
+					if (cmdCtx.hasUI && ui) ui.notify(text, "error");
+					else console.error(`[antigravity-bridge] ${text}`);
+				}
 				return;
 			}
 			if (sub === "patch-cleanup") {

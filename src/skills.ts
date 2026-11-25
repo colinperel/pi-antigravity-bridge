@@ -7,9 +7,8 @@
 // catalog in tools/list on every spawn, including after pi compaction.
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export const ACTIVATE_SKILL_TOOL_NAME = "activate_skill";
 
@@ -22,153 +21,64 @@ export interface SkillLite {
 	dir: string;
 }
 
-/** Parse `name:` / `description:` out of SKILL.md frontmatter. Deliberately
- *  line-based, not YAML: multi-line block scalars (`description: >-`) keep
- *  only their first line. */
-function parseFrontmatter(raw: string): { name?: string; description?: string } {
-	const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-	if (!m) return {};
-	const out: { name?: string; description?: string } = {};
-	for (const line of m[1].split(/\r?\n/)) {
-		const name = line.match(/^name:\s*(.+)$/);
-		if (name && !out.name) out.name = name[1].trim();
-		const desc = line.match(/^description:\s*(.+)$/);
-		if (desc && !out.description) out.description = desc[1].trim();
-	}
-	return out;
+export interface PiCommandLike {
+	name: string;
+	description?: string;
+	source: string;
+	sourceInfo?: { path?: string };
 }
 
-// The rest of this module mirrors pi's own skill discovery (pi docs
-// "docs/skills.md - Locations") so the bridge's activate_skill catalog
-// matches the [Skills] list pi shows in its system prompt:
-//
-// - Global: <agentDir>/skills (pi style) and ~/.agents/skills (agents style,
-//   the cross-harness standard).
-// - Project: <project>/.pi/skills (pi style; CONFIG_DIR_NAME, so rebranded
-//   distros relocate it) and .agents/skills in cwd + ancestors up
-//   to the git repo root (agents style).
-// - Both styles discover every directory holding a SKILL.md, recursively;
-//   grouping folders (no SKILL.md) are descended into and a skill's contents
-//   are freeform (no descent past its SKILL.md).
-// - pi style also treats root .md files as individual skills; agents style
-//   ignores root .md but picks up frontmatter .md files inside grouping
-//   folders.
-// - Skills without a description are not loaded (same as pi).
-// - Name collisions keep the first skill found, pi global dirs before
-//   project dirs.
-
-export type SkillStyle = "pi" | "agents";
-
-export interface SkillLocation {
-	dir: string;
-	style: SkillStyle;
-}
-
-const MAX_DEPTH = 16; // symlink-loop insurance; real catalogs nest 1-2 levels
-
-export interface SkillScanOptions {
-	/** Project root: adds the project pi-skills dir and ancestor .agents/skills
-	 *  dirs (walked up to the git root). */
-	projectDir?: string;
-	/** HOME override for the cross-harness ~/.agents/skills dir (tests). */
-	home?: string;
-	/** pi agent dir override for pi's user skills dir (tests). */
-	agentDir?: string;
-}
-
-/** Ordered skill locations for a session, mirroring pi's own loader:
- *  <agentDir>/skills, then cross-harness ~/.agents/skills; with a projectDir
- *  also <project>/<CONFIG_DIR_NAME>/skills and each ancestor's .agents/skills. */
-export function skillLocations(opts: SkillScanOptions = {}): SkillLocation[] {
-	const home = opts.home ?? os.homedir();
-	const agentDir = opts.agentDir ?? getAgentDir();
-	const out: SkillLocation[] = [
-		{ dir: path.join(agentDir, "skills"), style: "pi" },
-		{ dir: path.join(home, ".agents", "skills"), style: "agents" },
-	];
-	if (!opts.projectDir) return out;
-	out.push({ dir: path.join(opts.projectDir, CONFIG_DIR_NAME, "skills"), style: "pi" });
-	let dir = path.resolve(opts.projectDir);
-	for (;;) {
-		out.push({ dir: path.join(dir, ".agents", "skills"), style: "agents" });
-		if (path.dirname(dir) === dir || fs.existsSync(path.join(dir, ".git"))) break;
-		dir = path.dirname(dir);
-	}
-	return out;
-}
-
-function readSkillFile(file: string, fallbackName: string): SkillLite | null {
-	let raw = "";
+/** Read and verify a SKILL.md in a single pass, matching Pi's loadSkillFromFile:
+ *  fails closed on read errors, malformed YAML, missing/empty description
+ *  (e.g. missing closing `---`), or `disable-model-invocation: true`. */
+export function readModelInvocableSkill(
+	filePath: string,
+): { ok: true; body: string } | { ok: false; error: string } {
+	let raw: string;
 	try {
-		// Strip a UTF-8 BOM so editors that add one do not break the `---` anchor.
-		raw = fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "");
-	} catch {
-		return null;
+		raw = fs.readFileSync(filePath, "utf8");
+	} catch (err) {
+		return { ok: false, error: `failed to read skill: ${err instanceof Error ? err.message : String(err)}` };
 	}
-	const fm = parseFrontmatter(raw);
-	const description = (fm.description ?? "").trim();
-	// pi does not load skills without a description.
-	if (!description) return null;
-	return {
-		name: fm.name?.trim() || fallbackName,
-		description: description.replace(/\s+/g, " ").slice(0, 160),
-		filePath: file,
-		dir: path.dirname(file),
-	};
+	try {
+		const { frontmatter } = parseFrontmatter<Record<string, unknown>>(raw);
+		if (!frontmatter || typeof frontmatter !== "object") {
+			return { ok: false, error: "invalid skill frontmatter" };
+		}
+		const desc = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+		if (!desc) {
+			return { ok: false, error: "skill is missing a description" };
+		}
+		if (frontmatter["disable-model-invocation"] === true) {
+			return { ok: false, error: "skill disables model invocation" };
+		}
+		return { ok: true, body: raw };
+	} catch (err) {
+		return { ok: false, error: `invalid skill frontmatter: ${err instanceof Error ? err.message : String(err)}` };
+	}
 }
 
-function scanLocation(loc: SkillLocation): SkillLite[] {
-	const walk = (dir: string, depth: number): SkillLite[] => {
-		if (depth > MAX_DEPTH) return [];
-		let entries: fs.Dirent[];
-		try {
-			entries = fs.readdirSync(dir, { withFileTypes: true });
-		} catch {
-			return [];
-		}
-		const found: SkillLite[] = [];
-		for (const entry of entries) {
-			// Hidden entries are harness internals (e.g. ~/.agents/skills/.system);
-			// pi's own [Skills] list never includes them.
-			if (entry.name.startsWith(".")) continue;
-			const full = path.join(dir, entry.name);
-			let isDir: boolean;
-			try {
-				isDir = entry.isDirectory() || (entry.isSymbolicLink() && fs.statSync(full).isDirectory());
-			} catch {
-				continue;
-			}
-			if (isDir) {
-				if (fs.existsSync(path.join(full, "SKILL.md"))) {
-					const skill = readSkillFile(path.join(full, "SKILL.md"), entry.name);
-					if (skill) found.push(skill);
-				} else {
-					found.push(...walk(full, depth + 1));
-				}
-				continue;
-			}
-			if (!entry.name.endsWith(".md") || entry.name === "SKILL.md") continue;
-			const standalone = loc.style === "pi" ? depth === 0 : depth > 0;
-			if (!standalone) continue;
-			const skill = readSkillFile(full, entry.name.replace(/\.md$/, ""));
-			if (skill) found.push(skill);
-		}
-		return found;
-	};
-	return walk(loc.dir, 0);
-}
-
-/** pi-faithful skill catalog: every skill pi itself would load, deduped by
- *  name (first wins). All roots are injectable for tests. */
-export function scanSkills(opts: SkillScanOptions = {}): SkillLite[] {
+/** Extract model-invocable skills from Pi's `pi.getCommands()` output so the
+ *  bridge mirrors Pi's exact loaded skill set (`--no-skills`, `--skill`,
+ *  settings filters, package skills, `disable-model-invocation: true`, and
+ *  project trust). */
+export function skillsFromCommands(commands: readonly PiCommandLike[]): SkillLite[] {
 	const seen = new Set<string>();
 	const out: SkillLite[] = [];
-	for (const loc of skillLocations(opts)) {
-		for (const skill of scanLocation(loc)) {
-			if (seen.has(skill.name)) continue;
-			seen.add(skill.name);
-			out.push(skill);
-		}
+	for (const cmd of commands) {
+		if (cmd.source !== "skill") continue;
+		const filePath = cmd.sourceInfo?.path;
+		if (typeof filePath !== "string" || !filePath) continue;
+		const name = cmd.name.startsWith("skill:") ? cmd.name.slice("skill:".length) : cmd.name;
+		if (!name || seen.has(name)) continue;
+		seen.add(name);
+		if (!readModelInvocableSkill(filePath).ok) continue;
+		out.push({
+			name,
+			description: (cmd.description ?? "").replace(/\s+/g, " ").trim().slice(0, 160) || name,
+			filePath,
+			dir: path.dirname(filePath),
+		});
 	}
 	return out;
 }
@@ -180,15 +90,6 @@ export function findSkillByName(skills: SkillLite[], name: string): SkillLite | 
 /** One-liner list for the tool description: `- name: description`. */
 export function catalogSummary(skills: SkillLite[]): string {
 	return skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
-}
-
-/** Full body handed to agy when it activates a skill. */
-export function readSkillBody(skill: SkillLite): string {
-	try {
-		return fs.readFileSync(skill.filePath, "utf8");
-	} catch (err) {
-		return `failed to read skill: ${err instanceof Error ? err.message : String(err)}`;
-	}
 }
 
 /** JSON schema for the activate_skill bridge tool. */

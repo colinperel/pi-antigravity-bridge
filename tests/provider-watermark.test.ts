@@ -132,10 +132,9 @@ function withEnv(values: Record<string, string>, fn: () => Promise<void>): Promi
 }
 
 /** Wait for the queued persist chain to land, then read the file. */
-async function readDisk(storePath: string): Promise<Record<string, unknown>> {
-	return vi.waitFor(() => {
-		return JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, unknown>;
-	});
+async function readDisk(h: Harness): Promise<Record<string, unknown>> {
+	await h.store.flush();
+	return readStore(h.storePath);
 }
 
 function readStore(storePath: string): Record<string, unknown> {
@@ -152,11 +151,12 @@ test("same conversation across turns: watermark advances normally (happy path)",
 			// the watermark advances to the current pi message count.
 			assert.equal(h.seen.opts?.conversationId, "conv-a");
 			assert.equal(h.seen.opts?.prompt, "second");
-			const disk = await readDisk(h.storePath);
+			const disk = await readDisk(h);
 			const rec = Object.values(disk)[0] as { conversationId: string; lastMessageCount: number };
 			assert.equal(rec.conversationId, "conv-a");
 			assert.equal(rec.lastMessageCount, 2);
 		} finally {
+			await h.store.flush().catch(() => {});
 			fs.rmSync(h.dir, { recursive: true, force: true });
 		}
 	});
@@ -167,7 +167,7 @@ test("recreated conversation: stale record is dropped and the backlog is re-deli
 		const h = harness(["conv-a", "conv-b", "conv-c"]);
 		try {
 			await runTurn(h, ["first task"]);
-			const disk1 = await readDisk(h.storePath);
+			const disk1 = await readDisk(h);
 			const key = Object.keys(disk1)[0];
 			assert.equal((disk1[key] as { conversationId: string }).conversationId, "conv-a");
 
@@ -194,6 +194,7 @@ test("recreated conversation: stale record is dropped and the backlog is re-deli
 			assert.ok(prompt.includes("second"));
 			assert.ok(prompt.endsWith("continue"));
 		} finally {
+			await h.store.flush().catch(() => {});
 			fs.rmSync(h.dir, { recursive: true, force: true });
 		}
 	});
@@ -225,6 +226,7 @@ test("recreated conversation: system-prompt gate re-arms on the next turn", asyn
 			assert.ok(md.includes(SYS2), "carrier body refreshed on re-arm");
 			assert.ok(!(h.seen.opts?.prompt ?? "").includes(SYS2));
 		} finally {
+			await h.store.flush().catch(() => {});
 			fs.rmSync(h.dir, { recursive: true, force: true });
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -246,14 +248,14 @@ test("failed turn on the same conversation: watermark is not advanced (backlog r
 		]);
 		try {
 			await runTurn(h, ["first task"], SYS);
-			const disk1 = await readDisk(h.storePath);
+			const disk1 = await readDisk(h);
 			const key = Object.keys(disk1)[0];
 			const base = (disk1[key] as { conversationId: string; lastMessageCount: number }).lastMessageCount;
 			await runTurn(h, ["first task", "second"], SYS);
 			// agy's state after a failure is ambiguous (the prompt may never have
 			// landed), so the pre-turn watermark must survive unchanged. Advancing
 			// it would starve the digest of the missed turn (issue #1 class).
-			const disk2 = await readDisk(h.storePath);
+			const disk2 = await readDisk(h);
 			const rec = disk2[key] as { conversationId: string; lastMessageCount: number };
 			assert.equal(rec.conversationId, "conv-a");
 			assert.equal(rec.lastMessageCount, base, "failed turn must not advance the watermark");
@@ -274,6 +276,7 @@ test("failed turn on the same conversation: watermark is not advanced (backlog r
 			assert.ok(!(prompt.includes(SYS)), "no inline system prompt");
 			assert.ok((h.seen.opts?.agent ?? "").startsWith("pi-bridge-sys-"));
 		} finally {
+			await h.store.flush().catch(() => {});
 			fs.rmSync(h.dir, { recursive: true, force: true });
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -290,12 +293,13 @@ test("unknown-status turn on the same conversation: watermark is not advanced", 
 		try {
 			await runTurn(h, ["first task"]);
 			await runTurn(h, ["first task", "second"]);
-			const disk = await readDisk(h.storePath);
+			const disk = await readDisk(h);
 			const key = Object.keys(disk)[0];
 			const rec = disk[key] as { conversationId: string; lastMessageCount: number };
 			assert.equal(rec.conversationId, "conv-a");
 			assert.equal(rec.lastMessageCount, 1, "unknown outcome must not advance the watermark");
 		} finally {
+			await h.store.flush().catch(() => {});
 			fs.rmSync(h.dir, { recursive: true, force: true });
 		}
 	});
@@ -311,12 +315,13 @@ test("aborted turn on the same conversation: watermark is not advanced", async (
 		try {
 			await runTurn(h, ["first task"]);
 			await runTurn(h, ["first task", "second"]);
-			const disk = await readDisk(h.storePath);
+			const disk = await readDisk(h);
 			const key = Object.keys(disk)[0];
 			const rec = disk[key] as { conversationId: string; lastMessageCount: number };
 			assert.equal(rec.conversationId, "conv-a");
 			assert.equal(rec.lastMessageCount, 1, "aborted turn must not advance the watermark");
 		} finally {
+			await h.store.flush().catch(() => {});
 			fs.rmSync(h.dir, { recursive: true, force: true });
 		}
 	});

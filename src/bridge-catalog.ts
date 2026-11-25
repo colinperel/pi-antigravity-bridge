@@ -14,8 +14,14 @@ export const CALL_TOOL_NAME = "bridge_call_tool";
 const MAX_DESC_NAMES_CHARS = 4000;
 const MAX_INFO_TOOLS_PER_CALL = 20;
 
-/** Pi's seven built-in default tools; only these stay always-loaded when active. */
+/** Pi's seven built-in default tools; always-loaded directly when active. */
 const PI_DEFAULT_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+
+/** Subagent child lifecycle tools (pi-suba) exposed directly when active so
+ *  Antigravity subagents can hand off in one tool call without the two-step
+ *  bridge_tool_info/bridge_call_tool indirection. Only active inside subagent
+ *  child sessions, so parent tool catalogs stay unchanged. */
+const DIRECT_EXTENSION_TOOLS = new Set(["suba_ask", "suba_done", "suba_notify"]);
 
 const BRIDGE_INTERNAL_TOOLS = new Set([
 	"AskAntigravity",
@@ -64,12 +70,13 @@ export function bridgedPiTools(
 	);
 }
 
-/** Split authorized bridge tools into always-loaded Pi defaults and proxied extension tools. */
+/** Split authorized bridge tools into always-loaded direct tools (Pi defaults
+ *  plus subagent child lifecycle tools) and proxied extension tools. */
 export function partitionBridgeTools<T extends BridgeToolInfo>(tools: readonly T[]): { direct: T[]; proxied: T[] } {
 	const direct: T[] = [];
 	const proxied: T[] = [];
 	for (const tool of tools) {
-		if (PI_DEFAULT_TOOLS.has(tool.name)) direct.push(tool);
+		if (PI_DEFAULT_TOOLS.has(tool.name) || DIRECT_EXTENSION_TOOLS.has(tool.name)) direct.push(tool);
 		else proxied.push(tool);
 	}
 	return { direct, proxied };
@@ -88,6 +95,12 @@ export function codemodeCatalog<T extends BridgeToolInfo>(
 		? [{ name: cm.name, description: cm.description ?? cm.name, inputSchema: serializeToolSchema(cm.parameters) }]
 		: [];
 	return { direct, proxied };
+}
+
+/** Proxied tools exposed behind bridge_tool_info for the active bridge mode.
+ *  Shared by tools/list and bridge_tool_info so listing and inspection agree. */
+export function proxiedBridgeTools<T extends BridgeToolInfo>(authorized: readonly T[], mode: BridgeTools): T[] {
+	return mode === "codemode" ? codemodeCatalog(authorized).proxied : partitionBridgeTools(authorized).proxied;
 }
 
 /** Build the bridge_tool_info MCP tool definition listing proxied extension tool names. */
