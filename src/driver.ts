@@ -31,6 +31,7 @@ import type {
 	DriverSnapshot,
 	DriverState,
 	DriverTurnRequest,
+	TurnCloseReason,
 	TurnDriver,
 	TurnHandle,
 	TurnOutcome,
@@ -837,7 +838,7 @@ export class StreamDriver implements TurnDriver {
 		return next.conversationId === this.#boundConversation ? undefined : "conversation";
 	}
 
-	async close(reason: "recycle" | "shutdown", cause?: string): Promise<void> {
+	async close(reason: TurnCloseReason, cause?: string): Promise<void> {
 		const child = this.#child;
 		if (reason === "recycle" && cause) {
 			this.#stats.recycles += 1;
@@ -847,7 +848,15 @@ export class StreamDriver implements TurnDriver {
 		this.#log(`close:${reason}${cause ? `:${cause}` : ""}`);
 		const turn = this.#active;
 		if (turn && !turn.closed) {
-			this.#failTurn(turn, `agy driver ${reason === "recycle" ? "recycled" : "shut down"} mid-turn${cause ? ` (${cause})` : ""}`);
+			const action = reason === "preempt" ? "preempted" : reason === "recycle" ? "recycled" : "shut down";
+			this.#settle(turn, {
+				conversationId: turn.conversationId,
+				status: "ERROR",
+				response: turn.response,
+				error: `agy driver ${action} mid-turn${cause ? ` (${cause})` : ""}`,
+				finished: true,
+				aborted: reason === "preempt",
+			});
 		}
 		// Home disposal must NOT be gated on a live child: the child can exit
 		// (or be deadline-killed) well before close runs, and an early return

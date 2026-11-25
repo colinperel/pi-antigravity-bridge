@@ -617,23 +617,75 @@ export function sessionKey(
 	return base + (engine === "acp" ? "@acp" : "");
 }
 
-/** Rotate the bound agy conversation after pi compacts the session.
- *  Deleting the binding forces the next turn onto a fresh agy conversation so
- *  server-side context is freed alongside pi's transcript; recording the key
- *  in `pendingCompactionHandoff` guarantees a one-shot compaction handoff even
- *  when `config.digest` is disabled. Returns the rotated conversation id, or
- *  null when the session had no binding. */
-export function rotateSessionOnCompaction(
+/** Each rotation creates an identity that outlives its one-shot handoff.
+ *  A turn can settle after a newer turn has already consumed that handoff. */
+export class CompactionHandoffs {
+	#rotations = new Map<string, { generation: symbol; pending: boolean }>();
+
+	generation(key: string): symbol | undefined {
+		return this.#rotations.get(key)?.generation;
+	}
+
+	hasPending(key: string): boolean {
+		return this.#rotations.get(key)?.pending ?? false;
+	}
+
+	rotate(key: string, needsHandoff: boolean): void {
+		this.#rotations.set(key, { generation: Symbol(), pending: needsHandoff || this.hasPending(key) });
+	}
+
+	consume(key: string): void {
+		const rotation = this.#rotations.get(key);
+		if (rotation) rotation.pending = false;
+	}
+
+	/** Snapshot currently pending handoffs and their rotation identities so an
+	 *  async clear only drops handoffs that existed before it started. */
+	snapshotPending(): Map<string, symbol> {
+		const snapshot = new Map<string, symbol>();
+		for (const [key, rotation] of this.#rotations) {
+			if (rotation.pending) snapshot.set(key, rotation.generation);
+		}
+		return snapshot;
+	}
+
+	/** Drop pending flags for keys still at the snapshotted rotation identity
+	 *  without invalidating in-flight turns or newer rotations. */
+	clearPendingMatching(snapshot: ReadonlyMap<string, symbol>): void {
+		for (const [key, generation] of snapshot) {
+			const rotation = this.#rotations.get(key);
+			if (rotation && rotation.generation === generation) rotation.pending = false;
+		}
+	}
+
+	/** Drop undelivered handoffs without invalidating in-flight turns. */
+	clear(): void {
+		for (const rotation of this.#rotations.values()) rotation.pending = false;
+	}
+}
+
+/** Rotate only after pi commits a compaction. Drop old round-trips before
+ *  closing the driver: its turn-end hook would otherwise leave tombstones
+ *  for calls that must never be late-delivered to the rotated conversation.
+ *  The one-shot handoff forces the summary through even with digest off. */
+export async function rotateSessionOnCompaction(
 	store: SessionStore,
 	key: string,
-	pendingCompactionHandoff?: Set<string>,
-): string | null {
+	compactionHandoffs: CompactionHandoffs,
+	driver: TurnDriver,
+	roundTrips: ToolRoundTrips,
+): Promise<string | null> {
+	const active = driver.activeHandle !== null;
+	const discarded = roundTrips.discardForCompaction();
+	steerCursors.delete(key);
 	const existing = store.get(key);
-	if (!existing) return null;
-	store.delete(key);
-	stagedAgentByConversation.delete(existing.conversationId);
-	pendingCompactionHandoff?.add(key);
-	return existing.conversationId;
+	if (existing) {
+		store.delete(key);
+		stagedAgentByConversation.delete(existing.conversationId);
+	}
+	compactionHandoffs.rotate(key, Boolean(existing) || active || discarded);
+	if (active) await driver.close?.("preempt", "session compacted");
+	return existing?.conversationId ?? null;
 }
 
 /** Track which content block is currently open so we close-on-switch.
@@ -693,9 +745,7 @@ export interface StreamSimpleDeps {
 	 *  provider turns: an unstaged gate would let agy's native tools run
 	 *  without the pi-side approval the config asked for. */
 	gateUnavailable?: () => string | undefined;
-	/** Session keys rotated on `session_compact` awaiting a one-shot
-	 *  compaction handoff into a fresh agy conversation. */
-	pendingCompactionHandoff?: Set<string>;
+	compactionHandoffs?: CompactionHandoffs;
 	/** Live pi-side tool visibility (extension wiring). Lets prompt text
 	 *  adapt to the catalog the engine actually got; omitted in tests,
 	 *  which reads as "the configured mode is authoritative". */
@@ -726,6 +776,7 @@ export interface StreamSimpleDeps {
 const BRIDGE_TIMEOUT_MS = 480_000;
 /** Bounded memory of failed bridge parks (late-delivery tombstones). */
 const MAX_PARK_TOMBSTONES = 64;
+export const COMPACTION_DISCARD_REASON = "antigravity conversation was compacted";
 
 /** One MCP tool-result content block: text always; image blocks carry base64
  *  pixels and ride to the model on BOTH engines (ACP probe 2026-09-05;
@@ -811,6 +862,11 @@ export interface PollView {
  *  evict first (a running call is never evicted while a newer one is). */
 export class EscalationRegistry {
 	#calls = new Map<string, PollView>();
+	clear(): boolean {
+		const hadCalls = this.#calls.size > 0;
+		this.#calls.clear();
+		return hadCalls;
+	}
 	#trim(): void {
 		// Soft cap: only settled entries evict. Evicting a RUNNING call would
 		// strand its result (settle becomes a no-op, poll reports unknown), so
@@ -1141,12 +1197,10 @@ export class ToolRoundTrips {
 	}
 
 	/** Settle a parked approval with a deny. Used by the park timeout and
-	 *  failAll; the ticket is answered (fail closed) and the pending entry
-	 *  dropped, so the late shadow tool result logs as approval-late. */
-	#failApproval(ticket: string, reason: string, cause: "timeout" | "shutdown"): void {
-		const entry = this.#pending.get(ticket);
-		this.#pending.delete(ticket);
-		if (entry?.timer) clearTimeout(entry.timer);
+	 *  teardown; the ticket is answered (fail closed) and the pending entry
+	 *  dropped, so a late shadow tool result cannot approve it. */
+	#failApproval(ticket: string, reason: string, cause: "timeout" | "shutdown" | "compaction"): void {
+		const entry = this.#takePending(ticket);
 		const resolved = this.#approvalPark?.resolve(ticket, { allow: false, reason }) ?? false;
 		this.#log(
 			resolved ? `approval-${cause}` : "approval-late",
@@ -1161,7 +1215,7 @@ export class ToolRoundTrips {
 	 *  handle, and the agy turn ending does NOT make the still-running pi tool
 	 *  a failure. They settle through resolve(), their own 30m timer, or an
 	 *  abort signal on the pi tool call. */
-	failAll(reason: string): void {
+	failAll(reason: string, level: "warn" | "debug" = "warn"): void {
 		for (const id of [...this.#pending.keys()]) {
 			const entry = this.#pending.get(id);
 			if (entry?.kind === "approval") {
@@ -1169,22 +1223,40 @@ export class ToolRoundTrips {
 				continue;
 			}
 			if (entry?.kind === "bridge" && entry.escalated) continue;
-			this.#fail(id, reason);
+			this.#fail(id, reason, level);
 		}
 	}
 
-	#fail(callId: string, reason: string): void {
-		const entry = this.#pending.get(callId);
-		if (!entry) return;
-		if (entry.kind === "rt") {
-			// Nothing to reject, but the entry must not leak past turn death.
-			this.#pending.delete(callId);
-			return;
+	/** Forget the old conversation's entire bridge state. The compacted
+	 *  transcript, not late delivery or polls, carries the kept tool results. */
+	discardForCompaction(): boolean {
+		const hadEscalations = this.#escalations.clear();
+		const discarded = hadEscalations || this.#pending.size > 0 || this.#dead.size > 0;
+		this.#dead.clear();
+		for (const [id, entry] of this.#pending) {
+			if (entry.kind === "approval") {
+				this.#failApproval(id, COMPACTION_DISCARD_REASON, "compaction");
+			} else {
+				this.#takePending(id);
+				if (entry.kind === "bridge" && !entry.escalated) entry.reject!(new Error(COMPACTION_DISCARD_REASON));
+			}
 		}
+		return discarded;
+	}
+
+	#takePending(callId: string): PendingRoundTrip | undefined {
+		const entry = this.#pending.get(callId);
+		if (!entry) return undefined;
 		this.#pending.delete(callId);
 		clearTimeout(entry.timer);
-		if (entry.escalateTimer) clearTimeout(entry.escalateTimer);
+		clearTimeout(entry.escalateTimer);
 		if (entry.onAbort && entry.signal) entry.signal.removeEventListener("abort", entry.onAbort);
+		return entry;
+	}
+
+	#fail(callId: string, reason: string, level: "warn" | "debug" = "warn"): void {
+		const entry = this.#takePending(callId);
+		if (entry?.kind !== "bridge") return;
 		this.#dead.set(callId, { name: entry.name, reason });
 		while (this.#dead.size > MAX_PARK_TOMBSTONES) {
 			const oldest = this.#dead.keys().next().value;
@@ -1194,7 +1266,7 @@ export class ToolRoundTrips {
 		if (entry.escalated) this.#escalations.settleFailed(callId, reason);
 		entry.reject!(new Error(reason));
 		this.#getDriver().kickIdle();
-		this.#log("round-trip-fail", { callId, name: entry.name, reason });
+		this.#log("round-trip-fail", { callId, name: entry.name, reason }, level);
 	}
 
 	/** Park the MCP call: inject into the live agy turn. Fast calls settle
@@ -1269,19 +1341,13 @@ export class ToolRoundTrips {
 		isError: boolean,
 		images: Array<{ data: string; mimeType: string }> = [],
 	): boolean {
-		const entry = this.#pending.get(toolCallId);
+		const entry = this.#takePending(toolCallId);
 		if (!entry) return false;
-		this.#pending.delete(toolCallId);
-		clearTimeout(entry.timer);
-		if (entry.escalateTimer) clearTimeout(entry.escalateTimer);
-		if (entry.onAbort && entry.signal) entry.signal.removeEventListener("abort", entry.onAbort);
 		if (entry.kind === "rt") {
 			this.#log("round-trip-rt-done", { callId: toolCallId, name: entry.name, isError });
 			return true;
 		}
 		if (entry.kind === "approval") {
-			clearTimeout(entry.timer);
-			this.#pending.delete(toolCallId);
 			// Decision mapping (docs/TODO.md 2.5): block/error -> deny with the
 			// text (pi turns a tool_call block into an error tool result, so both
 			// paths land here); synthetic success -> allow.
@@ -1459,9 +1525,7 @@ export interface DriverDeps {
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
 	/** Subagent roster fold target (both engines; best-effort telemetry). */
 	roster?: SubagentRoster;
-	/** Session keys rotated on `session_compact` awaiting a one-shot
-	 *  compaction handoff into a fresh agy conversation. */
-	pendingCompactionHandoff?: Set<string>;
+	compactionHandoffs?: CompactionHandoffs;
 	/** Active engine (config), for engine-scoped session keys. */
 	engine: "stream-json" | "acp";
 	/** Live pi-side tool visibility (see StreamSimpleDeps). */
@@ -1710,9 +1774,21 @@ async function runTurnDriver(
 	// binding, never claim dead/stranded tool results, and never arm
 	// background watchers for throwaway turns.
 	const ephemeral = options?.cacheRetention === "none" || options?.disableContinuation === true;
-	const existing = ephemeral ? null : store.get(key);
-	const compactionHandoff =
-		!ephemeral && !existing?.conversationId && Boolean(deps.pendingCompactionHandoff?.has(key));
+	const handoffs = deps.compactionHandoffs;
+	const rotationAtStart = handoffs?.generation(key);
+	const rotatedSinceStart = (): boolean => handoffs?.generation(key) !== rotationAtStart;
+	const compactionHandoff = !ephemeral && handoffs?.hasPending(key) === true;
+	// A sync binding can be written before the prompt and left unsettled (e.g.
+	// a quota rejection). Until delivery, the handoff still needs a fresh turn.
+	const existing = ephemeral || compactionHandoff ? null : store.get(key);
+	// An armed handoff outranks every route back to the old conversation.
+	// Discard stale state defensively rather than letting it leak into a later
+	// pass after the fresh binding consumes the latch.
+	if (compactionHandoff) {
+		deps.roundTrips.discardForCompaction();
+		steerCursors.delete(key);
+	}
+	const mayContinue = !ephemeral && !compactionHandoff;
 	const messageCount = context.messages.length;
 	const config = loadConfig();
 	// Settle bookkeeping shared by both store.set paths: the boundary
@@ -1731,20 +1807,19 @@ async function runTurnDriver(
 	// Continuation: resolve parked round-trips from pi's toolResult messages,
 	// then re-attach to the still-running agy turn. No new user event is sent:
 	// agy receives the result via the bridge's MCP HTTP response.
-	const results = collectToolResults(context.messages, deps.roundTrips.pendingIds);
+	const pendingIds = mayContinue ? deps.roundTrips.pendingIds : [];
+	const results = collectToolResults(context.messages, pendingIds);
 	const isContinuation = results.length > 0;
 	// Scanned before the resolve loop: the pending set must still contain the
 	// parks being resolved. The steering floor is the session's dispatch
 	// cursor when one exists (dispatch length + delivered-through), else the
 	// first-pending-toolResult anchor fallback.
 	const steerCursor = steerCursors.get(key);
-	const steered = ephemeral
-		? []
-		: collectSteeredUserMessages(
-				context.messages,
-				deps.roundTrips.pendingIds,
-				steerCursor ? Math.max(steerCursor.dispatchedAt, steerCursor.deliveredThrough) : undefined,
-		  );
+	const steered = collectSteeredUserMessages(
+		context.messages,
+		pendingIds,
+		steerCursor ? Math.max(steerCursor.dispatchedAt, steerCursor.deliveredThrough) : undefined,
+	);
 	// Set when a steer leads the dead-turn fallback into a fresh dispatch: the
 	// steer shipped as that dispatch's own prompt, so the post-outcome sweep
 	// must stay off (and its stranded-claim re-sweep with it).
@@ -1774,7 +1849,7 @@ async function runTurnDriver(
 	// nor start a new prompt. Leave the tombstone for the next fresh pass
 	// instead of consuming it blind.
 	const late: LateToolResult[] = [];
-	if (!ephemeral && !isContinuation) {
+	if (mayContinue && !isContinuation) {
 		for (const r of collectToolResults(context.messages, deps.roundTrips.deadIds)) {
 			const dead = deps.roundTrips.consumeDead(r.toolCallId);
 			if (dead)
@@ -1789,7 +1864,7 @@ async function runTurnDriver(
 		if (late.length > 0) {
 			deps.log?.("late-result", { tools: late.map((l) => l.name), freshConversation: !existing?.conversationId }, "info");
 		}
-	} else if (!ephemeral && deps.roundTrips.deadIds.length > 0) {
+	} else if (mayContinue && deps.roundTrips.deadIds.length > 0) {
 		deps.log?.("late-result-deferred", { count: deps.roundTrips.deadIds.length }, "info");
 	}
 
@@ -1814,14 +1889,6 @@ async function runTurnDriver(
 				images: view.images,
 			};
 		});
-	// A rotation that lands mid-turn must win over any bind of a PRE-ROTATION
-	// conversation: continuations and strand redeliveries both target the old
-	// conversation id, so binding their outcomes would restore the
-	// rotated-away binding and swallow the handoff. Evaluated at bind time:
-	// the latch may arm after turn start.
-	const rotationGuardArmed = (): boolean =>
-		(isContinuation || redeliveryConversation !== undefined) &&
-		deps.pendingCompactionHandoff?.has(key) === true;
 	/** Stream-json has no image channel in the turn input: stage the blocks
 	 *  to temp files and let the note point the model at the bridge read
 	 *  tool, whose result images the CLI delivers (probe 2026-09-07). ACP
@@ -1878,7 +1945,7 @@ async function runTurnDriver(
 	} else {
 		// Dead turn: claim NOW (single-use). A live turn claims after outcome
 		// instead — claiming here would eat the post-outcome recovery.
-		if (!ephemeral) late.push(...collectStranded());
+		if (mayContinue) late.push(...collectStranded());
 		// A steer with a bound conversation leads the fresh dispatch instead of
 		// stopping quietly: the trailing user run becomes the prompt, so the
 		// message is answered rather than dropped or left to the digest window.
@@ -2005,20 +2072,33 @@ async function runTurnDriver(
 				}
 			}
 		}
-		// --- sync handoff mode (opt-in via AGY_HANDOFF=sync, ACP-only) ---
-		// The checkpoint/plan owns continuity instead of the digest: history
-		// ships as a framed resource block, the record persists the zeroed
-		// contract, and the settle bypasses the digest store writes. Legacy
-		// paths (late/strand redelivery, retry-dropped resume, post-compaction
-		// resume) and the churn latch stay on the digest flow.
-		// A fresh dispatch of the trailing user run opens a new steering window:
-		// everything up to here is the prompt the turn carries, so mid-park
-		// steers must land strictly after this index. Synthetic prompts (late
-		// strands, resume, compaction seeding) do NOT open one - their context
-		// may still hold undelivered steers.
-		if (!resume && !compactionResume && late.length === 0) {
+		// A fresh helper must release the parked turn's queue slot: Pi awaits
+		// compaction before it can send the continuation that would unpark it.
+		// Unlike session_compact, this must keep the binding and recovery state
+		// in case the helper fails and Pi keeps the original transcript.
+		if (!mayContinue && deps.driver.activeHandle) {
+			try {
+				await deps.driver.close?.("preempt", ephemeral ? "ephemeral helper" : "compaction handoff");
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				deps.log?.("turn-error", { reason: "driver-preempt-failed", error: msg }, "error");
+				finalize(stream, blocks, "error", `agy failed to release the previous turn: ${msg}`);
+				return;
+			}
+		}
+		// Preemption can wait on a child teardown. A newer compaction may have
+		// superseded this handoff before its prompt could be dispatched.
+		if (compactionHandoff && rotatedSinceStart()) {
+			finalize(stream, blocks, "aborted", "Operation aborted");
+			return;
+		}
+		// A real dispatch of the trailing user run opens a new steering window.
+		// Synthetic resume and late-result prompts do not carry that user run.
+		if (!ephemeral && !resume && !compactionResume && late.length === 0) {
 			steerCursors.set(key, { dispatchedAt: messageCount, deliveredThrough: 0 });
 		}
+		// Sync handoff (ACP-only) ships a history resource and persists its own
+		// checkpoint. Legacy late-delivery and resume paths stay on digest.
 		const handoffRuntime = deps.handoffRuntime;
 		const syncTurnRequested = config.handoff === "sync" && engine === "acp";
 		if (
@@ -2081,7 +2161,7 @@ async function runTurnDriver(
 					contextBlock: input.contextBlock,
 					onSessionBound: ({ sessionId }) => {
 						turn.adoptBinding(sessionId);
-						if (!rotationGuardArmed()) {
+						if (!rotatedSinceStart()) {
 							const rec = turn.record();
 							if (rec.conversationId) store.set(key, { ...rec, conversationId: rec.conversationId });
 						}
@@ -2105,7 +2185,7 @@ async function runTurnDriver(
 					},
 					signal: options?.signal,
 				});
-				handoffRuntime?.mode.set(key, "sync");
+				if (!rotatedSinceStart()) handoffRuntime?.mode.set(key, "sync");
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				deps.log?.("turn-error", { reason: "dispatch-failed", error: msg }, "error");
@@ -2294,7 +2374,7 @@ async function runTurnDriver(
 						: undefined,
 					signal: options?.signal,
 				});
-				if (!ephemeral) handoffRuntime?.mode.set(key, "digest");
+				if (!ephemeral && !rotatedSinceStart()) handoffRuntime?.mode.set(key, "digest");
 				digestDispatched = true;
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
@@ -2338,15 +2418,23 @@ async function runTurnDriver(
 		log: deps.log,
 	};
 
-	const drainTurn = async (h: TurnHandle): Promise<"parked" | undefined> => {
+	const drainTurn = async (h: TurnHandle): Promise<"parked" | "rotated" | undefined> => {
 		for (;;) {
 			const activity = await h.next();
 			if (!activity) break;
+			// A closed turn can still have buffered replay or bridge calls. Do
+			// not publish them as new Pi tools after its conversation rotated.
+			if (!ephemeral && rotatedSinceStart()) {
+				finalize(stream, blocks, "aborted", "Operation aborted");
+				return "rotated";
+			}
 			if (activity.type !== "text" && activity.type !== "usage") sawToolOrThought = true;
 			if (consumeActivity(stream, blocks, activity, diffCtx, cwd, feats) === "parked") return "parked";
 		}
 	};
-	if ((await drainTurn(handle)) === "parked") {
+	const drained = await drainTurn(handle);
+	if (drained === "rotated") return;
+	if (drained === "parked") {
 		// A park proves agy got the prompt and is working in this conversation.
 		// Persist a first-turn binding now: otherwise a first-ever turn that
 		// parks and then dies (failed continuation, process restart) leaves no
@@ -2355,7 +2443,7 @@ async function runTurnDriver(
 		// recreated a conversation, so the snapshot id is the real one, and
 		// the staged agent must move with the binding or a stream-json resume
 		// re-runs without its carrier-agent profile.
-		if (!ephemeral && !rotationGuardArmed() && (syncTurn || !existing)) {
+		if (!ephemeral && !rotatedSinceStart() && (syncTurn || !existing)) {
 			const parkedConv = deps.driver.snapshot().conversationId;
 			if (parkedConv) {
 				if (syncTurn) {
@@ -2365,7 +2453,6 @@ async function runTurnDriver(
 					syncTurn.adoptBinding(parkedConv);
 					const rec = syncTurn.record();
 					if (rec.conversationId) store.set(key, { ...rec, conversationId: rec.conversationId });
-					if (syncTurn.freshConversation) deps.pendingCompactionHandoff?.delete(key);
 				} else {
 					store.set(key, {
 						conversationId: parkedConv,
@@ -2374,9 +2461,9 @@ async function runTurnDriver(
 						digestBoundary: nextBoundary,
 						digestSummaryId: settleSummaryId,
 					});
-					deps.pendingCompactionHandoff?.delete(key);
 					if (stagedAgentName) stagedAgentByConversation.set(parkedConv, stagedAgentName);
 				}
+				if (compactionHandoff) handoffs?.consume(key);
 			}
 		}
 		return;
@@ -2403,7 +2490,7 @@ async function runTurnDriver(
 		outcome.modelOutputSeen === false &&
 		Boolean(existing?.conversationId);
 	if (silentDrop || poisonedResume) {
-		if (!ephemeral && (existing?.conversationId || outcome.conversationId)) {
+		if (!ephemeral && !rotatedSinceStart() && (existing?.conversationId || outcome.conversationId)) {
 			store.delete(key);
 			if (outcome.conversationId) stagedAgentByConversation.delete(outcome.conversationId);
 		}
@@ -2451,7 +2538,7 @@ async function runTurnDriver(
 	// A late-start failure must invalidate the sync contract below: its
 	// checkpoint would claim the steer agy never received.
 	let lateStartFailed = false;
-	if (!ephemeral && isContinuation && outcome.status === "OK" && !outcome.aborted) {
+	if (isContinuation && !rotatedSinceStart() && outcome.status === "OK" && !outcome.aborted) {
 		const more = steerLedFresh ? [] : collectStranded();
 		// Steered messages join the same late run: pi delivered them into the
 		// context while the turn was parked and the reentry pass sent nothing
@@ -2509,8 +2596,8 @@ async function runTurnDriver(
 					// Accepted by agy from here on: a parked late run hands
 					// recovery to the next pass, which must not re-collect it.
 					const cursor = steerCursors.get(key);
-					if (cursor && steered.length > 0) cursor.deliveredThrough = steered[steered.length - 1].index + 1;
-					if ((await drainTurn(lateHandle)) === "parked") return;
+					if (cursor && steered.length > 0 && !rotatedSinceStart()) cursor.deliveredThrough = steered[steered.length - 1].index + 1;
+					if (await drainTurn(lateHandle)) return;
 					outcome = await lateHandle.outcome;
 				} catch (err) {
 					// Release the claims so the next pass can retry the delivery.
@@ -2581,18 +2668,16 @@ async function runTurnDriver(
 				"info",
 			);
 			const record = settleSync.record();
-			if (record.conversationId && !rotationGuardArmed()) {
+			if (record.conversationId && !rotatedSinceStart()) {
 				store.set(key, { ...record, conversationId: record.conversationId });
-				// A rebuild shipped the compaction summary as history; the one-shot
-				// latch has no second consumer.
-				if (settleSync.freshConversation) deps.pendingCompactionHandoff?.delete(key);
+				if (compactionHandoff && result.settled === "terminal") handoffs?.consume(key);
 			}
 		} catch (err) {
 			// A settle invariant failure must not surface as an unhandled
 			// rejection (the caller is void): dropping the record forces a
 			// named rebuild next turn, the safe direction.
 			deps.log?.("sync-settle-failed", { key, error: err instanceof Error ? err.message : String(err) }, "error");
-			store.delete(key);
+			if (!rotatedSinceStart()) store.delete(key);
 		}
 	} else if (!ephemeral && outcome.conversationId) {
 		// A different id than the stored one means the driver recreated the
@@ -2604,10 +2689,12 @@ async function runTurnDriver(
 		// #1). The recreation turn itself is past the gate, so it is the
 		// documented residual; recovery starts on the next turn.
 		if (existing?.conversationId && outcome.conversationId !== existing.conversationId) {
-			store.delete(key);
-			stagedAgentByConversation.delete(existing.conversationId);
+			if (!rotatedSinceStart()) {
+				store.delete(key);
+				stagedAgentByConversation.delete(existing.conversationId);
+			}
 		} else if (outcome.status === "OK" && !outcome.aborted) {
-			if (rotationGuardArmed()) {
+			if (rotatedSinceStart()) {
 				deps.log?.("rotation-binding-deferred", { conversation: outcome.conversationId, key }, "info");
 			} else {
 				store.set(key, {
@@ -2621,7 +2708,7 @@ async function runTurnDriver(
 					// the session alternates rebuild/digest forever.
 					...(existing?.sync?.digestFallback ? { sync: existing.sync } : {}),
 				});
-				deps.pendingCompactionHandoff?.delete(key);
+				if (compactionHandoff) handoffs?.consume(key);
 				if (stagedAgentName) stagedAgentByConversation.set(outcome.conversationId, stagedAgentName);
 			}
 		}
@@ -2762,7 +2849,7 @@ export function createStreamSimple(
 				onNativeEvent: deps.onNativeEvent,
 				onNativeBackground: deps.onNativeBackground,
 				roster: deps.roster,
-				pendingCompactionHandoff: deps.pendingCompactionHandoff,
+				compactionHandoffs: deps.compactionHandoffs,
 				handoffRuntime,
 				hasActiveTool: deps.hasActiveTool,
 				// Record the engine of the driver that will ACTUALLY run: if the

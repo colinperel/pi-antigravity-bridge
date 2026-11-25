@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file.
 - `bridgeTools: "none"` no longer disables an active approval gate. Startup returned before staging the gate, so agy's native tools ran ungated while the provider stayed usable. The listener now starts for the gate alone and exposes no pi tools.
 - A required approval gate that cannot be staged (for example, the MCP listener failed to start) now refuses provider turns with a visible error instead of letting agy's native tools run without pi-side approval.
 - The shadow `bash` twin resolves a `file://` `shellPath` the way pi does.
-
+- Mid-tool-loop auto-compaction no longer waits for a parked Antigravity turn on ACP or stream-json. A failed or cancelled summary leaves the old conversation available for late tool delivery; successful compaction discards old bridge state and starts a fresh conversation with the summary and retained tool result, even when a different model summarized. An ACP sync handoff that hits quota before settling retries with the summary and can still commit a fresh checkpoint.
 ## [1.15.1] - 2026-11-25
 
 ### Fixed

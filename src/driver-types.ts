@@ -11,6 +11,7 @@
 // fallback, and `session/load` resume. See docs/ACP-ADOPTION-PLAN.md section 9.
 
 export type DriverState = "idle" | "starting" | "ready" | "running" | "dead";
+export type TurnCloseReason = "recycle" | "shutdown" | "preempt";
 
 export interface DriverProfile {
 	cwd: string;
@@ -198,5 +199,7 @@ export interface TurnDriver {
 	kickIdle(): void;
 	set onTurnEnd(fn: ((outcome: TurnOutcome) => void) | undefined);
 	snapshot(): DriverSnapshot;
-	close(reason: "recycle" | "shutdown", cause?: string): Promise<void>;
+	/** Tear down the transport and settle the live turn. Preemption is a
+	 *  deliberate abort, not an unexpected turn failure. */
+	close(reason: TurnCloseReason, cause?: string): Promise<void>;
 }

@@ -895,6 +895,41 @@ describe("acp/driver shutdown latch", () => {
 	});
 });
 
+test("ACP preemption cancels permissions and releases the queue for a fresh prompt", async () => {
+	const dir = tmpDir();
+	let permissionRequested!: () => void;
+	const waiting = new Promise<void>((resolve) => { permissionRequested = resolve; });
+	let cancelled = false;
+	const driver = new AcpDriver({
+		bin: process.execPath,
+		binArgs: [FAKE_SERVER],
+		extraEnv: { ACP_FAKE_SCENARIO: "permission" },
+		onPermissionRequest: () => {
+			permissionRequested();
+			return new Promise<undefined>(() => {});
+		},
+		log: (msg, data) => {
+			if (msg === "permission" && (data as { policy?: string })?.policy === "cancel") cancelled = true;
+		},
+	});
+	try {
+		const request = { cwd: dir, model: "gemini-3.8-flash", mode: "accept-edits" as const, conversationId: null };
+		const parked = await driver.run({ ...request, prompt: "first", skipPermissions: false });
+		await waiting;
+		const summary = driver.run({ ...request, prompt: "summarize", skipPermissions: true });
+		await driver.close("preempt", "ephemeral helper");
+		const cancelledOnClose = cancelled;
+		const summarized = await (await summary).outcome;
+		assert.equal((await parked.outcome).aborted, true);
+		assert.equal(cancelledOnClose, true, "the parked permission was cancelled without waiting for process exit");
+		assert.equal(summarized.response, "PERMIS");
+		assert.equal(driver.snapshot().stats.spawns, 2);
+	} finally {
+		await driver.close("shutdown");
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 describe("acp/driver usage synthesis (Gate B stopgap)", () => {
 	test("default (estimate): OK turns carry synthetic usage + a usage activity", async () => {
 		const run = await tracked("think", { prompt: "one two three" });

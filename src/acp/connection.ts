@@ -225,7 +225,7 @@ export class AcpConnection {
 
 		const rpc = new JsonRpcSession({
 			send: (frame) => this.#write(frame),
-			onRequest: (method, params) => this.#onServerRequest(method, params),
+			onRequest: async (method, params) => this.alive ? this.#onServerRequest(method, params) : undefined,
 			onNotification: (method, params) => this.#onNotification(method, params),
 			onParseError: (line) => this.#opts.log("parse-error", { line }),
 			onOverflow: (detail) => {
@@ -249,7 +249,9 @@ export class AcpConnection {
 		});
 		this.#rpc = rpc;
 
-		child.stdout?.on("data", (chunk: string) => rpc.feed(chunk));
+		child.stdout?.on("data", (chunk: string) => {
+			if (this.alive) rpc.feed(chunk);
+		});
 		child.stderr?.on("data", (chunk: string) => {
 			this.#stderrTail = (this.#stderrTail + chunk).slice(-8192);
 		});
@@ -400,7 +402,7 @@ export class AcpConnection {
 	cancel(sessionId: string): void {
 		if (!this.#rpc || !this.alive) throw new Error("ACP connection is not running");
 		this.#rpc.notify("session/cancel", { sessionId });
-		for (const cancel of [...this.#permissionPending]) cancel();
+		this.#cancelPermissions();
 	}
 
 	async closeSession(sessionId: string): Promise<void> {
@@ -481,7 +483,7 @@ export class AcpConnection {
 			}, parkMs);
 			this.#permissionPending.add(settleCancel);
 			Promise.resolve()
-				.then(() => handler(params))
+				.then(() => settled ? undefined : handler(params))
 				.then((picked) => {
 					if (settled) return;
 					const chosen = picked != null ? options.find((o) => o.optionId === picked) : undefined;
@@ -568,6 +570,7 @@ export class AcpConnection {
 		if (this.#killed) return;
 		this.#killed = true;
 		this.abortAll("connection killed");
+		this.#cancelPermissions();
 		const child = this.#child;
 		if (!child || this.#exited) return;
 		this.#opts.log("kill", { pid: child.pid ?? "?" });
@@ -592,14 +595,14 @@ export class AcpConnection {
 	#finish(reason: string, code: number | null = null, signal: NodeJS.Signals | null = null): void {
 		if (this.#exited) return;
 		this.#exited = true;
-		// Pending permission dialogs must not outlive the connection: cancel them
-		// so their replies race the teardown instead of hanging the server.
-		const pendings = [...this.#permissionPending];
-		this.#permissionPending.clear();
-		for (const deny of pendings) deny();
 		this.abortAll(`connection exited: ${reason || "process gone"}`);
+		this.#cancelPermissions();
 		this.#releaseHome();
 		this.#opts.onExit({ code, signal, stderrTail: redactText(this.#stderrTail) });
+	}
+
+	#cancelPermissions(): void {
+		for (const cancel of this.#permissionPending) cancel();
 	}
 
 	#releaseHome(): void {

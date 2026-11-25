@@ -39,6 +39,8 @@ import {
 import type { SessionStore } from "../src/sessions.js";
 import {
 	APPROVAL_PARK_MS,
+	COMPACTION_DISCARD_REASON,
+	CompactionHandoffs,
 	POLL_TOOL_NAME,
 	ToolRoundTrips,
 	WrapperReplay,
@@ -176,7 +178,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	// failAll reasons the bridge treats as routine (turn end / shutdown
 	// sweep), not faults. Shared by the emitters below and the mcpLog
-	// classifier so the substring match cannot drift from the text.
+	// classifier, which also recognizes COMPACTION_DISCARD_REASON.
 	const FAIL_REASON_TURN_END = "antigravity turn ended with an unresolved pi tool call";
 	const FAIL_REASON_SHUTDOWN = "antigravity session shut down";
 
@@ -522,9 +524,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			// Error text can embed the child's stderr tail; cap it in line with
 			// the ACP driver's 200-char stderr slices.
 			{ status: outcome.status, error: outcome.error?.slice(0, 500), aborted: outcome.aborted },
-			outcome.status === "OK" ? "info" : "warn",
+			outcome.status === "OK" || outcome.aborted ? "info" : "warn",
 		);
-		roundTrips.failAll(FAIL_REASON_TURN_END);
+		// Deliberate preemption keeps tombstones for failed-compaction recovery
+		// but must not toast that the old turn or tool failed unexpectedly.
+		roundTrips.failAll(FAIL_REASON_TURN_END, outcome.aborted ? "debug" : "warn");
 		// Closes a poll run that no display event flushed.
 		closePollRun();
 		// Stamp live escalations with the ended turn's conversation: the park
@@ -639,29 +643,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			fileLog.log("session-store-flush-error", { error: err instanceof Error ? err.message : String(err) }, "warn");
 		}),
 	);
-	// Session keys whose bound agy conversation was rotated on session_compact
-	// so the next turn starts a fresh backend conversation and ships the
-	// compaction summary once (even when config.digest is disabled).
-	const pendingCompactionHandoff = new Set<string>();
-	const handoffGeneration = new Map<string, number>();
-	let handoffSeq = 0;
+	const compactionHandoffs = new CompactionHandoffs();
 	pi.on("session_shutdown", () => {
 		backgroundWatchDisposed = true;
 		for (const handle of backgroundWatchers.values()) handle.stop();
 		backgroundWatchers.clear();
-		pendingCompactionHandoff.clear();
-		handoffGeneration.clear();
+		compactionHandoffs.clear();
 	});
-	pi.on("session_compact", (_event, ctx) => {
+	pi.on("session_compact", async (_event, ctx) => {
 		try {
-			// Shape-cast as in model_select below: tolerate pi builds whose dts
-			// omits getSessionId.
-			const sm = ctx.sessionManager as { getSessionId?: () => string };
-			const sid = sm.getSessionId?.();
+			const sid = liveSessionId(ctx.sessionManager);
 			const key = sessionKey(sid ? { sessionId: sid } : undefined, ctx.cwd, engine);
-			const rotated = rotateSessionOnCompaction(store, key, pendingCompactionHandoff);
+			const rotated = await rotateSessionOnCompaction(store, key, compactionHandoffs, activeDriver(), roundTrips);
 			if (rotated) {
-				handoffGeneration.set(key, ++handoffSeq);
 				fileLog.log("session-compact-rotate", { key, previousConversation: rotated }, "info");
 			}
 		} catch (err) {
@@ -678,10 +672,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				digestEnabled: loadConfig().digest,
 				source: event.source,
 				bound: (() => {
-					// Shape-cast as in the session_compact handler above: tolerate pi
-					// builds whose dts omits getSessionId.
-					const sm = ctx.sessionManager as { getSessionId?: () => string };
-					const sid = sm.getSessionId?.();
+					const sid = liveSessionId(ctx.sessionManager);
 					const key = sessionKey(sid ? { sessionId: sid } : undefined, ctx.cwd, engine);
 					return store.get(key) !== null;
 				})(),
@@ -706,7 +697,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
 		roster,
 		gateUnavailable: () => gateUnavailable,
-		pendingCompactionHandoff,
+		compactionHandoffs,
 		hasActiveTool: (name) => pi.getActiveTools().includes(name),
 		engine,
 		log: fileLog.log.bind(fileLog),
@@ -757,16 +748,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		hiddenBridgeTools,
 		fileLog,
 		roster,
-		pendingCompactionHandoff,
-		clearHandoffsThrough: (snapshot, cutoff) => {
-			for (const key of snapshot) {
-				if ((handoffGeneration.get(key) ?? 0) <= cutoff) {
-					pendingCompactionHandoff.delete(key);
-					handoffGeneration.delete(key);
-				}
-			}
-		},
-		currentHandoffSeq: () => handoffSeq,
+		compactionHandoffs,
 		checkAgySetup,
 		setActiveUi: (ui) => {
 			activeUi = ui;
@@ -983,16 +965,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			// filters below only decide what reaches the user. Bridge calls
 			// start/end at info (one record per tool call, the fragile-path
 			// skeleton); list-tools and startup chatter stay verbose.
-			// Routine abort traffic (failAll on turn end / session shutdown
-			// answers every parked call with an error) is not a fault: debug
-			// only. Any other call-tool-fail is a real rejection (e.g. "no
-			// active antigravity turn" from a client that should not see the
+			// Routine abort traffic (turn end, compaction, session shutdown
+			// answer parked calls with an error) is not a fault: debug only.
+			// Any other call-tool-fail is a real rejection (e.g. "no active
+			// antigravity turn" from a client that should not see the
 			// bridge) and lands at error tier - default mode records errors
 			// only, so this is the sole durable trace of the incident.
 			const detail = (d as { msg?: string } | undefined)?.msg ?? "";
 			const routineAbort =
 				s === "call-tool-fail" &&
-				(detail.includes(FAIL_REASON_TURN_END) || detail.includes(FAIL_REASON_SHUTDOWN));
+				[FAIL_REASON_TURN_END, FAIL_REASON_SHUTDOWN, COMPACTION_DISCARD_REASON].some((reason) => detail.includes(reason));
 			const level = !failures.has(s)
 				? s === "call-tool" || s === "call-tool-ok"
 					? "info"
@@ -1358,9 +1340,7 @@ interface AgyCommandCtx {
 	fileLog: DailyLogger;
 	/** Live subagent roster (folded in the provider); /agy subagents. */
 	roster: SubagentRoster;
-	pendingCompactionHandoff: Set<string>;
-	clearHandoffsThrough: (snapshot: ReadonlySet<string>, cutoff: number) => void;
-	currentHandoffSeq: () => number;
+	compactionHandoffs: CompactionHandoffs;
 	checkAgySetup: (ctx: { ui: ExtensionUIContext; mode: string }, engine: Engine, explicit?: boolean) => Promise<void>;
 	setActiveUi: (ui: ExtensionUIContext) => void;
 }
@@ -1437,11 +1417,10 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 
 			// Direct subcommands work everywhere (headless + TUI).
 			if (sub === "clear") {
-				const handoffSnapshot = new Set(ctx.pendingCompactionHandoff);
-				const handoffCutoff = ctx.currentHandoffSeq();
+				const handoffSnapshot = ctx.compactionHandoffs.snapshotPending();
 				try {
 					await ctx.store.clearNow();
-					ctx.clearHandoffsThrough(handoffSnapshot, handoffCutoff);
+					ctx.compactionHandoffs.clearPendingMatching(handoffSnapshot);
 					if (cmdCtx.hasUI && ui) ui.notify("Cleared all antigravity session bindings.", "info");
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
